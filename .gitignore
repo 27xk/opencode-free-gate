@@ -3,3 +3,6 @@
 *.log
 gate
 *.test
+debug/
+opencode-free-gate*
+req_*.json

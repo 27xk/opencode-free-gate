@@ -61,7 +61,7 @@ func loadConfig(project projectSpec) config {
 		slotRetries:      nonNegative(envInt("SLOT_RETRIES", slotCount)),
 		customRetries:    nonNegative(envInt("CUSTOM_RETRIES", 10)),
 		zenRetries:       nonNegative(envInt("ZENPROXY_RETRIES", 5)),
-		customProxies:    os.Getenv("CUSTOM_PROXIES"),
+		customProxies:    envString("CUSTOM_PROXIES", envString("ALL_PROXY", envString("HTTPS_PROXY", envString("HTTP_PROXY", "")))),
 		zenRelay:         envString("ZENPROXY_RELAY", "https://zenproxy.top/api/relay"),
 		zenKey:           os.Getenv("ZENPROXY_KEY"),
 		forceRelay:       os.Getenv("FORCE_RELAY") == "1",

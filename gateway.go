@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -74,15 +75,34 @@ type gateway struct {
 	rootContext   context.Context
 	modelMu       sync.Mutex
 	modelCache    *cachedModels
+	failuresMu    sync.Mutex
+	failures      map[string]time.Time
 }
 
 func newGateway(cfg config) *gateway {
-	return &gateway{cfg: cfg}
+	gw := &gateway{
+		cfg:      cfg,
+		failures: make(map[string]time.Time),
+	}
+	if cfg.customProxies != "" {
+		for _, candidate := range parseCustomProxies(cfg.customProxies) {
+			gw.addSlot(candidate, true)
+		}
+	}
+	return gw
 }
 
 func (g *gateway) start(ctx context.Context) {
 	g.rootContext = ctx
 	go func() {
+		if err := g.initCustomSlots(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[兜底] initial fill failed: %v", err)
+		}
+		if g.cfg.project.modelMode != modelPassthrough {
+			mCtx, mCancel := context.WithTimeout(ctx, 5*time.Second)
+			_, _ = g.modelMaps(mCtx)
+			mCancel()
+		}
 		if g.cfg.usesPublicPool() {
 			if err := g.loadCandidates(ctx); err != nil {
 				log.Printf("[选] load failed: %v", err)
@@ -90,9 +110,6 @@ func (g *gateway) start(ctx context.Context) {
 			if err := g.fillSlots(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("[槽] initial fill failed: %v", err)
 			}
-		}
-		if err := g.initCustomSlots(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("[兜底] initial fill failed: %v", err)
 		}
 		log.Printf("[门] 预热完成")
 	}()
@@ -152,8 +169,15 @@ func (g *gateway) loadCandidates(parent context.Context) error {
 	}
 	filtered := make([]proxyItem, 0, len(all))
 	for _, item := range all {
-		if item.QualityGrade == "S" && item.Status == "active" {
+		if (item.QualityGrade == "S" || item.QualityGrade == "A") && item.Status == "active" {
 			filtered = append(filtered, item)
+		}
+	}
+	if len(filtered) == 0 {
+		for _, item := range all {
+			if item.Status == "active" {
+				filtered = append(filtered, item)
+			}
 		}
 	}
 	sort.SliceStable(filtered, func(i, j int) bool { return filtered[i].Latency < filtered[j].Latency })
@@ -161,7 +185,7 @@ func (g *gateway) loadCandidates(parent context.Context) error {
 	g.mu.Lock()
 	g.candidates = filtered
 	g.mu.Unlock()
-	log.Printf("[选] %d S-grade candidates", len(filtered))
+	log.Printf("[选] %d candidate proxies", len(filtered))
 	return nil
 }
 
@@ -241,8 +265,12 @@ func (g *gateway) fillSlots(ctx context.Context) error {
 }
 
 func (g *gateway) initCustomSlots(ctx context.Context) error {
-	parsed := parseCustomProxies(g.cfg.customProxies)
-	if len(parsed) == 0 {
+	g.mu.RLock()
+	candidates := make([]slot, len(g.custom))
+	copy(candidates, g.custom)
+	g.mu.RUnlock()
+
+	if len(candidates) == 0 {
 		return nil
 	}
 
@@ -251,9 +279,9 @@ func (g *gateway) initCustomSlots(ctx context.Context) error {
 		latency time.Duration
 		ok      bool
 	}
-	results := make(chan probeResult, len(parsed))
+	results := make(chan probeResult, len(candidates))
 	var wg sync.WaitGroup
-	for _, candidate := range parsed {
+	for _, candidate := range candidates {
 		candidate := candidate
 		wg.Add(1)
 		go func() {
@@ -270,12 +298,15 @@ func (g *gateway) initCustomSlots(ctx context.Context) error {
 
 	ready := 0
 	for result := range results {
-		if result.ok && g.addSlot(result.slot, true) {
+		if result.ok {
 			ready++
 			log.Printf("[兜底+] %s (%dms)", result.slot.addr, result.latency.Milliseconds())
+		} else {
+			log.Printf("[兜底-] %s 探测不通 (已降权)", result.slot.addr)
+			g.markFailure(result.slot.addr)
 		}
 	}
-	log.Printf("[兜底] %d/%d custom proxies ready", ready, len(parsed))
+	log.Printf("[兜底] %d/%d custom proxies ready", ready, len(candidates))
 	return nil
 }
 
@@ -412,9 +443,32 @@ func (g *gateway) slotAddresses(custom bool) []string {
 	return result
 }
 
+func (g *gateway) markFailure(addr string) {
+	g.failuresMu.Lock()
+	defer g.failuresMu.Unlock()
+	if g.failures == nil {
+		g.failures = make(map[string]time.Time)
+	}
+	g.failures[addr] = time.Now()
+}
+
+func (g *gateway) isAddrHealthy(addr string) bool {
+	g.failuresMu.Lock()
+	defer g.failuresMu.Unlock()
+	if g.failures == nil {
+		return true
+	}
+	if t, ok := g.failures[addr]; ok {
+		if time.Since(t) < 60*time.Second {
+			return false
+		}
+		delete(g.failures, addr)
+	}
+	return true
+}
+
 // nextSlot 选取下一个代理槽位。session 非空时使用 rendezvous 哈希，
-// 让同一会话在槽位存活期间固定同一出口（匿名通道按出口 IP 限流），
-// 槽位增删只影响映射到该槽位的会话；session 为空时保持轮询行为。
+// 优先挑选健康节点（排除最近 60 秒内超时的节点），让同一会话在槽位存活期间固定同一出口。
 func (g *gateway) nextSlot(custom bool, tried map[string]struct{}, session string, attempt int) (slot, bool) {
 	g.mu.RLock()
 	source := g.slots
@@ -429,6 +483,11 @@ func (g *gateway) nextSlot(custom bool, tried map[string]struct{}, session strin
 
 	if session != "" {
 		sort.SliceStable(snapshot, func(i, j int) bool {
+			hI := g.isAddrHealthy(snapshot[i].addr)
+			hJ := g.isAddrHealthy(snapshot[j].addr)
+			if hI != hJ {
+				return hI
+			}
 			return rendezvousScore(session, snapshot[i].addr) > rendezvousScore(session, snapshot[j].addr)
 		})
 		if custom {
@@ -613,6 +672,9 @@ func openHTTP(ctx context.Context, method, target string, headers http.Header, b
 	req.Header = headers.Clone()
 	req.Header.Del("Host")
 	req.Header.Del("Content-Length")
+	if req.Header.Get("X-Opencode-Request") != "" {
+		req.Header.Set("X-Opencode-Request", globalIDGen.generate("msg", false))
+	}
 
 	res, err := client.Do(req)
 	stopped := timer.Stop()
@@ -688,8 +750,11 @@ func (g *gateway) perform(ctx context.Context, request upstreamRequest, proxyURL
 	}
 	status := live.response.StatusCode
 	header := cloneEndToEndHeaders(live.response.Header)
-	if request.stream && status < 400 {
+	if request.stream && !request.nonStream && status < 400 {
 		return &gatewayResponse{status: status, header: header, live: live}, nil
+	}
+	if request.nonStream && status < 400 {
+		return aggregateSSEResponse(live, request.path, header, request.deadline)
 	}
 	body, err := live.readAll(request.deadline)
 	if err != nil {
@@ -784,8 +849,15 @@ func (g *gateway) dispatchPublicLayer(ctx context.Context, request upstreamReque
 			trace.finalProxy = candidate.addr
 			return response, nil
 		}
-		log.Printf("[错码] %s 状态码 %d", candidate.addr, response.status)
+		log.Printf("[错码] %s 状态码 %d %s", candidate.addr, response.status, summarizeErrorBody(response.body))
 		g.dropSlot(candidate.addr)
+		if response.status == http.StatusForbidden {
+			request.session = globalIDGen.generate("ses", true)
+			if request.headers != nil {
+				request.headers = request.headers.Clone()
+				request.headers.Set("X-Opencode-Session", request.session)
+			}
+		}
 		last = response
 		lastProxy = candidate.addr
 	}
@@ -815,6 +887,7 @@ func (g *gateway) dispatchCustomLayer(ctx context.Context, request upstreamReque
 		log.Printf("[自定义] %s (%d/%d)", candidate.addr, retry+1, maxRetries)
 		response, err := g.perform(ctx, request, candidate.proxyURL)
 		if err != nil {
+			g.markFailure(candidate.addr)
 			if isTerminalContextError(ctx, err) {
 				return nil, err
 			}
@@ -825,7 +898,15 @@ func (g *gateway) dispatchCustomLayer(ctx context.Context, request upstreamReque
 			trace.finalProxy = candidate.addr
 			return response, nil
 		}
-		log.Printf("[错码] %s 状态码 %d", candidate.addr, response.status)
+		g.markFailure(candidate.addr)
+		log.Printf("[错码] %s 状态码 %d %s", candidate.addr, response.status, summarizeErrorBody(response.body))
+		if response.status == http.StatusForbidden {
+			request.session = globalIDGen.generate("ses", true)
+			if request.headers != nil {
+				request.headers = request.headers.Clone()
+				request.headers.Set("X-Opencode-Session", request.session)
+			}
+		}
 		last = response
 		lastProxy = candidate.addr
 	}
@@ -860,7 +941,7 @@ func (g *gateway) dispatchZen(ctx context.Context, request upstreamRequest, trac
 			trace.finalProxy = "ZenProxy"
 			return response, nil
 		}
-		log.Printf("[ZenProxy] 状态码 %d，重试", response.status)
+		log.Printf("[ZenProxy] 状态码 %d %s，重试", response.status, summarizeErrorBody(response.body))
 		last = response
 	}
 	if last != nil {
@@ -900,8 +981,11 @@ func (g *gateway) performRelay(ctx context.Context, request upstreamRequest) (*g
 	}
 	status := live.response.StatusCode
 	header := cloneEndToEndHeaders(live.response.Header)
-	if request.stream && status < 400 {
+	if request.stream && !request.nonStream && status < 400 {
 		return &gatewayResponse{status: status, header: header, live: live}, nil
+	}
+	if request.nonStream && status < 400 {
+		return aggregateSSEResponse(live, request.path, header, request.deadline)
 	}
 	body, err := live.readAll(request.deadline)
 	if err != nil {
@@ -975,4 +1059,293 @@ func hopByHopHeader(key string) bool {
 	default:
 		return false
 	}
+}
+
+func aggregateSSEResponse(live *liveResponse, path string, header http.Header, deadline time.Time) (*gatewayResponse, error) {
+	defer live.Close()
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return nil, errRequestTimeout
+	}
+	timer := time.AfterFunc(remaining, func() {
+		live.cancel()
+	})
+	defer timer.Stop()
+
+	rawBytes, err := io.ReadAll(io.LimitReader(live.response.Body, maxUpstreamBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(rawBytes) > maxUpstreamBody {
+		return nil, fmt.Errorf("upstream response exceeds %d bytes", maxUpstreamBody)
+	}
+
+	trimmed := bytes.TrimSpace(rawBytes)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		header.Set("Content-Type", "application/json; charset=utf-8")
+		return &gatewayResponse{
+			status: live.response.StatusCode,
+			header: header,
+			body:   trimmed,
+		}, nil
+	}
+
+	var jsonBody []byte
+	switch {
+	case strings.HasSuffix(path, "/messages"):
+		jsonBody, err = aggregateAnthropicSSE(trimmed)
+	case strings.HasSuffix(path, "/responses"):
+		jsonBody, err = aggregateCodexSSE(trimmed)
+	default:
+		jsonBody, err = aggregateOpenAISSE(trimmed)
+	}
+	if err != nil {
+		log.Printf("[SSE聚合] 解析失败: %v, 返回原始内容", err)
+		return &gatewayResponse{
+			status: live.response.StatusCode,
+			header: header,
+			body:   rawBytes,
+		}, nil
+	}
+
+	header.Set("Content-Type", "application/json; charset=utf-8")
+	header.Del("Content-Length")
+	return &gatewayResponse{
+		status: live.response.StatusCode,
+		header: header,
+		body:   jsonBody,
+	}, nil
+}
+
+func aggregateOpenAISSE(data []byte) ([]byte, error) {
+	var contentBuilder strings.Builder
+	id := ""
+	model := ""
+	var created int64
+	role := "assistant"
+	finishReason := "stop"
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		var chunk struct {
+			ID      string `json:"id"`
+			Created int64  `json:"created"`
+			Model   string `json:"model"`
+			Choices []struct {
+				Index int `json:"index"`
+				Delta struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+
+		if chunk.ID != "" && id == "" {
+			id = chunk.ID
+		}
+		if chunk.Model != "" && model == "" {
+			model = chunk.Model
+		}
+		if chunk.Created != 0 && created == 0 {
+			created = chunk.Created
+		}
+
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Role != "" {
+				role = choice.Delta.Role
+			}
+			if choice.Delta.Content != "" {
+				contentBuilder.WriteString(choice.Delta.Content)
+			}
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
+				finishReason = *choice.FinishReason
+			}
+		}
+	}
+
+	if id == "" {
+		id = "chatcmpl-" + globalIDGen.generate("msg", false)
+	}
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+
+	resp := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":    role,
+					"content": contentBuilder.String(),
+				},
+				"finish_reason": finishReason,
+			},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":     0,
+			"completion_tokens": 0,
+			"total_tokens":      0,
+		},
+	}
+	return json.Marshal(resp)
+}
+
+func aggregateAnthropicSSE(data []byte) ([]byte, error) {
+	var message map[string]any
+	var textBuilder strings.Builder
+	stopReason := "end_turn"
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		var event map[string]any
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			continue
+		}
+
+		eventType, _ := event["type"].(string)
+		switch eventType {
+		case "message_start":
+			if msg, ok := event["message"].(map[string]any); ok {
+				message = msg
+			}
+		case "content_block_delta":
+			if delta, ok := event["delta"].(map[string]any); ok {
+				if text, ok := delta["text"].(string); ok {
+					textBuilder.WriteString(text)
+				}
+			}
+		case "message_delta":
+			if delta, ok := event["delta"].(map[string]any); ok {
+				if sr, ok := delta["stop_reason"].(string); ok && sr != "" {
+					stopReason = sr
+				}
+			}
+			if usage, ok := event["usage"].(map[string]any); ok && message != nil {
+				if existingUsage, ok := message["usage"].(map[string]any); ok {
+					for k, v := range usage {
+						existingUsage[k] = v
+					}
+				}
+			}
+		}
+	}
+
+	if message == nil {
+		message = map[string]any{
+			"id":    "msg_" + globalIDGen.generate("msg", false),
+			"type":  "message",
+			"role":  "assistant",
+			"model": "opencode",
+		}
+	}
+	message["content"] = []any{
+		map[string]any{
+			"type": "text",
+			"text": textBuilder.String(),
+		},
+	}
+	message["stop_reason"] = stopReason
+	return json.Marshal(message)
+}
+
+func aggregateCodexSSE(data []byte) ([]byte, error) {
+	var completedResponse map[string]any
+	var textBuilder strings.Builder
+	responseID := ""
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		var event map[string]any
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			continue
+		}
+
+		if resp, ok := event["response"].(map[string]any); ok {
+			completedResponse = resp
+			break
+		}
+		if id, ok := event["id"].(string); ok && responseID == "" {
+			responseID = id
+		}
+		if delta, ok := event["delta"].(string); ok {
+			textBuilder.WriteString(delta)
+		}
+	}
+
+	if completedResponse != nil {
+		return json.Marshal(completedResponse)
+	}
+
+	if responseID == "" {
+		responseID = "resp_" + globalIDGen.generate("msg", false)
+	}
+
+	result := map[string]any{
+		"id":     responseID,
+		"object": "response",
+		"status": "completed",
+		"output": []any{
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{
+						"type": "text",
+						"text": textBuilder.String(),
+					},
+				},
+			},
+		},
+	}
+	return json.Marshal(result)
+}
+
+func summarizeErrorBody(body []byte) string {
+	s := strings.TrimSpace(string(body))
+	if len(s) == 0 {
+		return ""
+	}
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", "")
+	if len(s) > 300 {
+		return s[:300] + "..."
+	}
+	return s
 }

@@ -6,13 +6,13 @@
 
 - 每次代理尝试使用独立的 `http.Transport`，不共享故障连接。
 - 流式请求默认 3 秒内拿不到响应头就取消当前尝试，整个代理链共享 10 秒总预算。
-- 非流式请求不限制响应首字节，允许完整响应在默认 300 秒内结束。
-- 流式请求在成功取得响应头后可继续传输；客户端断开或流长时间无数据时自动清理连接。
-- 普通业务 `400/404/422` 直接返回，不再无意义地轮换代理。
-- 支持公共 S 级代理、自定义代理和 ZenProxy relay 多级回退，回退顺序可通过 `PROXY_ORDER` 自定义。
-- 上游请求携带完整 OpenCode 客户端头：真实 `User-Agent`、`x-opencode-client`、稳定会话哈希 `x-opencode-session`、每请求唯一 `x-opencode-request`（同一请求的代理重试保持不变）与 `x-opencode-project`。
+- 非流式请求自动转换：上游始终走 OpenCode 免费层要求的 `stream: true`，网关自动聚合 SSE 事件流并向非流式客户端返回标准的完整 JSON 响应。
+- 自动适配 OpenCode 免费模型最新风控：请求体自动注入/补全 `tools` 数组（包含 `bash` 且数量 ≥2）与 `stream: true`，彻底解决 `403 FreeTierError` 限制。
+- 上游请求携带真实 OpenCode 客户端指纹头：`User-Agent: opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14`（支持通过 `OPENCODE_USER_AGENT` 自定义）、`x-opencode-client: cli`、`x-opencode-project: global`。
+- 会话与请求标识 100% 还原 OpenCode CLI 源码算法：生成带 12 位时间戳 Hex 与 14 位 Base62 字符的合规标识（请求为 `msg_` 升序，会话为 `ses_` 降序）。
+- 会话缓存与亲和性：多轮对话首条消息映射并缓存到稳定会话 ID，同一会话优先固定同一代理出口（rendezvous 哈希亲和），故障时自动回退。
 - `/v1/messages` 与真实 OpenCode 客户端一致，使用 `x-api-key` 认证并自动补齐 `anthropic-version`。
-- 同一会话优先固定同一代理出口（rendezvous 哈希亲和），减少匿名通道按出口 IP 限流带来的抖动；出口故障时自动回退到其他槽位。
+- 支持兼容常见免费模型别名（如 `muse-spark-1.3`、`big-pickle`）。
 - 保留原有 Docker 镜像名、端口、路由和环境变量。
 
 ## API 路由
@@ -24,16 +24,15 @@
 | Codex | `/codex/v1/responses` |
 | 健康检查 | `/healthz` |
 
-模型列表每 60 秒从 OpenCode 上游刷新一次，仅展示 `-free` 模型，并额外保留 `big-pickle`。请求中的展示名称会自动改回上游模型名称。
+模型列表每 60 秒从 OpenCode 官方上游动态刷新，提取 `-free` 免费模型（展示时自动去除 `-free`，请求时自动补齐 `-free`）并保留特殊的 `big-pickle`。请求中的展示名称与别名会自动映射回上游模型名称。
 
-## 会话 ID
+## 会话与请求 ID
 
 网关为每个上游请求生成 OpenCode 协议要求的标识头，客户端无需自行构造：
 
-- 优先使用客户端提供的 `x-opencode-session`、`x-session-id`、`conversation-id`、请求体 `conversation_id` 或 `metadata.session_id` 派生会话 ID。
-- 没有显式会话标识时，使用第一条用户消息（Responses 请求使用 `input` 或 `previous_response_id`）生成稳定会话哈希，同一段多轮对话始终映射到同一会话与同一代理出口。
-- 两个独立会话的第一条消息完全相同时，建议客户端发送不同的 `x-session-id` 以严格分离。
-- `x-opencode-request` 每个客户端请求重新生成，同一请求内的代理重试保持不变。
+- 客户端若传入合规的 `x-opencode-session`（`ses_` + 26 字符），直接保留使用。
+- 其他显式会话标识（`x-session-id`、`conversation-id`、请求体 `conversation_id` 或 `metadata.session_id`）或对话首条消息，通过会话缓存映射为合规的 `ses_` 标识，保证多轮对话始终映射到同一会话。
+- 每请求唯一生成合规的 `msg_` 标识，同一客户端请求在多级代理重试期间保持不变。
 
 ## Docker 部署
 
@@ -75,6 +74,7 @@ docker run -d \
 | `PROXY_FIRST_BYTE_TIMEOUT` | `3000` | 流式请求单次尝试取得响应头的最大时间，毫秒 |
 | `HARD_TIMEOUT` | `10000` | 流式请求选择和重试链的总预算，毫秒 |
 | `NON_STREAM_TIMEOUT` | `300000` | 非流式请求从进入网关到完整响应结束的最高时间，毫秒 |
+| `OPENCODE_USER_AGENT` | `opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14` | 发往上游的 User-Agent |
 | `TZ` | 系统默认 | 容器时区；镜像已包含 `tzdata` |
 
 当前生产使用的 `CUSTOM_PROXIES`、重试次数和 ZenProxy 配置均可原样沿用。

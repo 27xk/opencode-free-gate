@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -425,5 +426,99 @@ func TestConcurrentPublicSlotSelectionRoundRobins(t *testing.T) {
 		if got := counts[address]; got != requests/len(addresses) {
 			t.Fatalf("expected %s to receive %d selections, got %d", address, requests/len(addresses), got)
 		}
+	}
+}
+
+func TestAggregateOpenAISSE(t *testing.T) {
+	sseData := `data: {"id":"chatcmpl-1","model":"muse-spark-1.3","created":12345678,"choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}
+data: {"id":"chatcmpl-1","model":"muse-spark-1.3","created":12345678,"choices":[{"index":0,"delta":{"content":" world!"},"finish_reason":"stop"}]}
+data: [DONE]`
+
+	aggregated, err := aggregateOpenAISSE([]byte(sseData))
+	if err != nil {
+		t.Fatalf("aggregateOpenAISSE failed: %v", err)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(aggregated, &resp); err != nil {
+		t.Fatalf("failed to unmarshal aggregated JSON: %v", err)
+	}
+
+	if resp["id"] != "chatcmpl-1" {
+		t.Fatalf("expected id chatcmpl-1, got %v", resp["id"])
+	}
+	choices, ok := resp["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		t.Fatal("missing choices in response")
+	}
+	firstChoice := choices[0].(map[string]any)
+	msg := firstChoice["message"].(map[string]any)
+	if msg["content"] != "Hello world!" {
+		t.Fatalf("expected 'Hello world!', got %q", msg["content"])
+	}
+	if firstChoice["finish_reason"] != "stop" {
+		t.Fatalf("expected finish_reason 'stop', got %v", firstChoice["finish_reason"])
+	}
+}
+
+func TestAggregateAnthropicSSE(t *testing.T) {
+	sseData := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","content":[],"model":"union-alpha","usage":{"input_tokens":10,"output_tokens":0}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Claude"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" response"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}
+
+event: message_stop
+data: {"type":"message_stop"}`
+
+	aggregated, err := aggregateAnthropicSSE([]byte(sseData))
+	if err != nil {
+		t.Fatalf("aggregateAnthropicSSE failed: %v", err)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(aggregated, &resp); err != nil {
+		t.Fatalf("failed to unmarshal aggregated JSON: %v", err)
+	}
+
+	if resp["id"] != "msg_123" {
+		t.Fatalf("expected id msg_123, got %v", resp["id"])
+	}
+	if resp["stop_reason"] != "end_turn" {
+		t.Fatalf("expected stop_reason end_turn, got %v", resp["stop_reason"])
+	}
+	content := resp["content"].([]any)
+	firstBlock := content[0].(map[string]any)
+	if firstBlock["text"] != "Claude response" {
+		t.Fatalf("expected 'Claude response', got %q", firstBlock["text"])
+	}
+}
+
+func TestAggregateCodexSSE(t *testing.T) {
+	sseData := `data: {"delta":"Codex"}
+data: {"delta":" reply"}
+data: {"response":{"id":"resp_xyz","status":"completed","output":[{"type":"message","content":[{"type":"text","text":"Codex reply"}]}]}}`
+
+	aggregated, err := aggregateCodexSSE([]byte(sseData))
+	if err != nil {
+		t.Fatalf("aggregateCodexSSE failed: %v", err)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(aggregated, &resp); err != nil {
+		t.Fatalf("failed to unmarshal aggregated JSON: %v", err)
+	}
+
+	if resp["id"] != "resp_xyz" {
+		t.Fatalf("expected id resp_xyz, got %v", resp["id"])
+	}
+	if resp["status"] != "completed" {
+		t.Fatalf("expected status completed, got %v", resp["status"])
 	}
 }

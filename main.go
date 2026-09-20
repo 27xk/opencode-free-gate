@@ -213,12 +213,18 @@ func (a *app) handlePost(w http.ResponseWriter, r *http.Request, path string, de
 
 	payload := parseJSONObject(body)
 	ids := deriveRequestIDs(r.Header, payload)
-	stream := wantsStream(r.Header, payload)
-	if !stream {
+	streamClient := wantsStream(r.Header, payload)
+	if m := stringAt(payload, "model"); m != "" {
+		log.Printf("[请求模型] %s (会话:%s, 流式:%v)", m, ids.Session, streamClient)
+	}
+	if !streamClient {
 		deadline = trace.start.Add(a.gateway.cfg.nonStreamTimeout)
 	}
-	if stream {
-		body = ensureStream(body, payload)
+	if payload != nil {
+		ensureStreamAndTools(path, payload)
+		if rewritten, err := json.Marshal(payload); err == nil {
+			body = rewritten
+		}
 	}
 	if a.gateway.cfg.project.modelMode != modelPassthrough {
 		modelContext, cancel := context.WithDeadline(r.Context(), deadline)
@@ -230,21 +236,16 @@ func (a *app) handlePost(w http.ResponseWriter, r *http.Request, path string, de
 	if strings.HasPrefix(path, "/v1/messages") {
 		applyAnthropicAuth(headers)
 	}
-	if headers.Get("Accept") == "" {
-		headers.Set("Accept", "application/json, text/event-stream")
-	}
+	headers.Set("Accept", "text/event-stream")
 	request := upstreamRequest{
 		method:    http.MethodPost,
 		path:      path,
 		headers:   headers,
 		body:      body,
-		stream:    stream,
-		nonStream: !stream,
+		stream:    true,
+		nonStream: !streamClient,
 		session:   ids.Session,
 		deadline:  deadline,
-	}
-	if stream {
-		request.headers.Set("Accept", "text/event-stream")
 	}
 	return a.gateway.dispatch(r.Context(), request, trace)
 }

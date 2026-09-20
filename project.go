@@ -27,7 +27,6 @@ type projectSpec struct {
 	modelMode             modelMode
 	ownedBy               string
 	extraModels           []string
-	specialModels         map[string]string
 }
 
 func currentProject() projectSpec {

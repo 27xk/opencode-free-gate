@@ -2,9 +2,53 @@ package main
 
 import (
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestOpencodeIDFormatAndGeneration(t *testing.T) {
+	msg := globalIDGen.generate("msg", false)
+	if !isValidOpencodeID(msg, "msg") {
+		t.Fatalf("generated request id should be valid opencode msg format: %q", msg)
+	}
+	if len(msg) != 30 {
+		t.Fatalf("expected length 30, got %d for %q", len(msg), msg)
+	}
+
+	ses := globalIDGen.generate("ses", true)
+	if !isValidOpencodeID(ses, "ses") {
+		t.Fatalf("generated session id should be valid opencode ses format: %q", ses)
+	}
+	if len(ses) != 30 {
+		t.Fatalf("expected length 30, got %d for %q", len(ses), ses)
+	}
+}
+
+func TestIsValidOpencodeID(t *testing.T) {
+	validMsg := "msg_0b20bce72001HhNaOVex180aKz"
+	validSes := "ses_f4df4cb3bffetj5bTDp2vZHLRH"
+	if !isValidOpencodeID(validMsg, "msg") {
+		t.Fatalf("expected %q to be valid msg", validMsg)
+	}
+	if !isValidOpencodeID(validSes, "ses") {
+		t.Fatalf("expected %q to be valid ses", validSes)
+	}
+
+	invalid := []string{
+		"",
+		"msg_",
+		"msg_123",
+		"req_0b20bce72001HhNaOVex180aKz",
+		"msg_0b20bce72001HhNaOVex180aK!", // invalid char
+		"ses_f4df4cb3bffetj5bTDp2vZHLRHxxx", // too long
+	}
+	for _, id := range invalid {
+		if isValidOpencodeID(id, "msg") {
+			t.Fatalf("expected %q to be invalid msg", id)
+		}
+	}
+}
 
 func TestDeriveRequestIDsStableAcrossTurns(t *testing.T) {
 	turn1 := map[string]any{
@@ -49,11 +93,24 @@ func TestDeriveRequestIDsHonorsExplicitSession(t *testing.T) {
 	if withHeader.Session == withOther.Session {
 		t.Fatal("explicit session ids must separate identical openers")
 	}
-	if !strings.HasPrefix(withHeader.Session, "ses_") {
+	if !isValidOpencodeID(withHeader.Session, "ses") {
 		t.Fatalf("session id must use the opencode format: %q", withHeader.Session)
 	}
-	if !strings.HasPrefix(withHeader.Request, "req_") || !strings.HasPrefix(withHeader.Project, "prj_") {
+	if !isValidOpencodeID(withHeader.Request, "msg") || withHeader.Project != "global" {
 		t.Fatalf("unexpected id formats: %q %q", withHeader.Request, withHeader.Project)
+	}
+
+	// Test preserving legitimate OpenCode session ID
+	opencodeSes := "ses_f4df4cb3bffetj5bTDp2vZHLRH"
+	headersOC := http.Header{}
+	headersOC.Set("x-opencode-session", opencodeSes)
+	headersOC.Set("x-opencode-project", "my-project")
+	withOC := deriveRequestIDs(headersOC, bodyA)
+	if withOC.Session != opencodeSes {
+		t.Fatalf("valid opencode session should be preserved, got %q", withOC.Session)
+	}
+	if withOC.Project != "my-project" {
+		t.Fatalf("custom project should be preserved, got %q", withOC.Project)
 	}
 }
 
@@ -68,6 +125,108 @@ func TestDeriveRequestIDsResponsesInput(t *testing.T) {
 	againPrevious := deriveRequestIDs(http.Header{}, map[string]any{"previous_response_id": "resp_123"})
 	if viaPrevious.Session != againPrevious.Session {
 		t.Fatal("previous_response_id must yield a stable session")
+	}
+}
+
+func TestEnsureStreamAndTools(t *testing.T) {
+	// Case 1: Empty tools for OpenAI path (/v1/chat/completions)
+	payload1 := map[string]any{
+		"model": "muse-spark-1.3",
+	}
+	ensureStreamAndTools("/v1/chat/completions", payload1)
+	if stream, _ := payload1["stream"].(bool); !stream {
+		t.Fatal("stream must be true")
+	}
+	tools1, ok := payload1["tools"].([]any)
+	if !ok || len(tools1) < 2 {
+		t.Fatalf("expected at least 2 tools, got %v", payload1["tools"])
+	}
+	// Verify OpenAI standard format: {"type":"function", "function": {"name": "bash", ...}}
+	tool0, _ := tools1[0].(map[string]any)
+	if tool0["type"] != "function" {
+		t.Fatalf("expected tool type function, got %v", tool0["type"])
+	}
+	fn0, ok := tool0["function"].(map[string]any)
+	if !ok || fn0["name"] != "bash" {
+		t.Fatalf("expected function.name bash, got %v", fn0)
+	}
+
+	// Case 2: Non-standard flat tool converted to standard OpenAI format
+	payload2 := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "custom_search"},
+		},
+	}
+	ensureStreamAndTools("/v1/chat/completions", payload2)
+	tools2 := payload2["tools"].([]any)
+	if len(tools2) < 2 {
+		t.Fatalf("expected at least 2 tools, got %d", len(tools2))
+	}
+	hasBash := false
+	for _, tool := range tools2 {
+		m := tool.(map[string]any)
+		if fn, ok := m["function"].(map[string]any); ok && fn["name"] == "bash" {
+			hasBash = true
+		}
+	}
+	if !hasBash {
+		t.Fatal("expected bash tool with nested function object to be injected")
+	}
+
+	// Case 3: Anthropic path (/v1/messages)
+	payload3 := map[string]any{
+		"model": "muse-spark-1.3",
+	}
+	ensureStreamAndTools("/v1/messages", payload3)
+	tools3 := payload3["tools"].([]any)
+	if len(tools3) < 2 {
+		t.Fatalf("expected at least 2 tools for Anthropic, got %d", len(tools3))
+	}
+	toolAnthropic0, _ := tools3[0].(map[string]any)
+	if toolAnthropic0["name"] != "bash" || toolAnthropic0["input_schema"] == nil {
+		t.Fatalf("expected Anthropic tool format with input_schema, got %v", toolAnthropic0)
+	}
+
+	// Case 4: Many tools provided without 'read', ensure 'read' is unconditionally added
+	payload4 := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "tool_1"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "tool_2"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "bash"}},
+		},
+	}
+	ensureStreamAndTools("/v1/chat/completions", payload4)
+	tools4 := payload4["tools"].([]any)
+	hasBash4 := false
+	hasRead4 := false
+	for _, tool := range tools4 {
+		m := tool.(map[string]any)
+		if fn, ok := m["function"].(map[string]any); ok {
+			if fn["name"] == "bash" {
+				hasBash4 = true
+			}
+			if fn["name"] == "read" {
+				hasRead4 = true
+			}
+		}
+	}
+	if !hasBash4 || !hasRead4 {
+		t.Fatalf("expected both bash and read to be present, got hasBash=%v, hasRead=%v", hasBash4, hasRead4)
+	}
+}
+
+func TestOpencodeUserAgent(t *testing.T) {
+	orig := os.Getenv("OPENCODE_USER_AGENT")
+	defer os.Setenv("OPENCODE_USER_AGENT", orig)
+
+	os.Unsetenv("OPENCODE_USER_AGENT")
+	if !strings.HasPrefix(opencodeUserAgent(), "opencode/1.18.31") {
+		t.Fatalf("expected default UA to match opencode/1.18.31, got %q", opencodeUserAgent())
+	}
+
+	os.Setenv("OPENCODE_USER_AGENT", "custom-agent/1.0")
+	if opencodeUserAgent() != "custom-agent/1.0" {
+		t.Fatalf("expected custom UA, got %q", opencodeUserAgent())
 	}
 }
 

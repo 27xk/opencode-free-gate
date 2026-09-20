@@ -21,6 +21,19 @@ type cachedModels struct {
 	loadedAt time.Time
 }
 
+// defaultModelMaps 基础免费模型兜底映射，防止首次启动若遇上游网络抖动拉取失败导致映射为空引发 401 ModelError。
+var defaultModelMaps = map[string]string{
+	"muse-spark-1.3-contributor-free": "muse-spark-1.3-contributor",
+	"muse-spark-1.2-contributor-free": "muse-spark-1.2-contributor",
+	"deepseek-v4-flash-free":          "deepseek-v4-flash",
+	"big-pickle":                      "big-pickle",
+	"jev-1.13-free":                   "jev-1.13",
+	"mimo-v2.5-free":                  "mimo-v2.5",
+	"ling-3.0-flash-fin-free":         "ling-3.0-flash-fin",
+	"nemotron-3-ultra-free":           "nemotron-3-ultra",
+	"nemotron-3.5-lightning-free":     "nemotron-3.5-lightning",
+}
+
 func (g *gateway) modelMaps(ctx context.Context) (map[string]string, map[string]string) {
 	g.modelMu.Lock()
 	defer g.modelMu.Unlock()
@@ -36,10 +49,10 @@ func (g *gateway) modelMaps(ctx context.Context) (map[string]string, map[string]
 			g.modelCache.loadedAt = time.Now().Add(-(modelCacheTTL - 5*time.Second))
 			return cloneStringMap(g.modelCache.rename), cloneStringMap(g.modelCache.redirect)
 		}
-		log.Printf("[模型] 刷新失败且无缓存: %v", err)
-		rename = cloneStringMap(g.cfg.project.specialModels)
+		log.Printf("[模型] 刷新失败且无缓存，使用内置兜底映射: %v", err)
+		rename = cloneStringMap(defaultModelMaps)
 		redirect := buildRedirect(rename)
-		// 短暂缓存失败结果，避免上游故障时并发请求在互斥锁后逐个等待 8 秒。
+		// 短暂缓存兜底结果，避免上游故障时并发请求在互斥锁后逐个等待 8 秒。
 		g.modelCache = &cachedModels{
 			rename:   cloneStringMap(rename),
 			redirect: cloneStringMap(redirect),
@@ -89,7 +102,7 @@ func (g *gateway) fetchModelMaps(parent context.Context) (map[string]string, err
 		return nil, err
 	}
 
-	rename := cloneStringMap(g.cfg.project.specialModels)
+	rename := make(map[string]string)
 	for _, id := range ids {
 		switch g.cfg.project.modelMode {
 		case modelKilo:
@@ -102,6 +115,8 @@ func (g *gateway) fetchModelMaps(parent context.Context) (map[string]string, err
 		case modelOpenCode:
 			if strings.HasSuffix(id, "-free") {
 				rename[id] = strings.TrimSuffix(id, "-free")
+			} else if id == "big-pickle" {
+				rename[id] = id
 			}
 		}
 	}
@@ -176,8 +191,27 @@ func (g *gateway) rewriteModel(ctx context.Context, body []byte) []byte {
 		return body
 	}
 	model, _ := payload["model"].(string)
+	if model == "" {
+		return body
+	}
+
 	upstream, exists := redirect[model]
 	if !exists {
+		cleanModel := strings.TrimPrefix(model, "oc/")
+		cleanModel = strings.TrimPrefix(cleanModel, "opencode/")
+		if target, ok := redirect[cleanModel]; ok {
+			upstream = target
+			exists = true
+		} else if g.cfg.project.modelMode == modelOpenCode && !strings.HasSuffix(model, "-free") && model != "big-pickle" {
+			log.Printf("[模型提示] 请求模型 %q 尚未在已知免费字典中，自动追加 -free 规避 403", model)
+			upstream = model + "-free"
+			exists = true
+		} else {
+			log.Printf("[模型警告] 请求模型 %q 不在免费映射表中，上游可能判定越权返回 403 FreeTierError", model)
+			return body
+		}
+	}
+	if upstream == model {
 		return body
 	}
 	payload["model"] = upstream
@@ -189,23 +223,34 @@ func (g *gateway) rewriteModel(ctx context.Context, body []byte) []byte {
 	return rewritten
 }
 
+func buildRedirect(rename map[string]string) map[string]string {
+	redirect := make(map[string]string, len(rename)*2+4)
+	for upstream, display := range rename {
+		// 1. 展示名称（如去除 -free 后的名称）映射回真实上游名称（如带 -free 的名称）
+		if display != "" {
+			redirect[display] = upstream
+		}
+		// 2. 客户端若本身就传入带 -free 的真实上游名称，保持不变
+		redirect[upstream] = upstream
+	}
+	// 3. 常见客户端别名兼容：例如客户端常传 muse-spark-1.3 省略 contributor
+	if target, ok := redirect["muse-spark-1.3-contributor"]; ok {
+		redirect["muse-spark-1.3"] = target
+	}
+	if target, ok := redirect["muse-spark-1.2-contributor"]; ok {
+		redirect["muse-spark-1.2"] = target
+	}
+	// 4. 若客户端误传 big-pickle-free，纠正为真实名称 big-pickle
+	if _, ok := redirect["big-pickle"]; ok {
+		redirect["big-pickle-free"] = "big-pickle"
+	}
+	return redirect
+}
+
 func cloneStringMap(source map[string]string) map[string]string {
 	result := make(map[string]string, len(source))
 	for key, value := range source {
 		result[key] = value
 	}
 	return result
-}
-
-func buildRedirect(rename map[string]string) map[string]string {
-	upstreamIDs := make([]string, 0, len(rename))
-	for upstream := range rename {
-		upstreamIDs = append(upstreamIDs, upstream)
-	}
-	sort.Strings(upstreamIDs)
-	redirect := make(map[string]string, len(rename))
-	for _, upstream := range upstreamIDs {
-		redirect[rename[upstream]] = upstream
-	}
-	return redirect
 }
